@@ -1,146 +1,97 @@
 # NCAA Basketball Machine Learning Prediction
 
-Predicting the 2024 NCAA Division I Men's Basketball Tournament (March Madness) champion using historical tournament data, regular-season statistics, and a deep-learning model.
+A machine learning project for predicting NCAA Tournament outcomes using detailed regular-season box-score data. Three modeling approaches are implemented end-to-end — an XGBoost margin regressor with spline-calibrated win probabilities, a Random Forest next-season scoring projection, and an LSTM time-series experiment — each evaluated against an appropriate baseline.
 
-## Overview
+This project prioritizes honest evaluation over model complexity. One model works modestly, one works on a different task, one failed to outperform a naive baseline and is documented as a failed experiment.
 
-Every March, 68 college basketball teams face off in a single-elimination tournament where a single bad game ends a championship run. The odds of filling out a perfect bracket are roughly 1 in 9.2 quintillion — but with enough historical data and the right model, you can dramatically improve your picks over guessing.
+---
 
-This project trains models on recent seasons of NCAA men's basketball data (from the Kaggle *March Machine Learning Mania 2023* competition, plus FiveThirtyEight's tournament forecasts) and uses an LSTM neural network to predict which team is most likely to win the 2024 tournament. The entire workflow — data loading, feature engineering, model training, and final prediction — lives in a single Google Colab notebook.
+## Results at a Glance
 
-## Project Structure
+| Model | Task | Metric | Result | Baseline |
+|---|---|---|---|---|
+| XGBoost + Spline | Predict winner of 2022 tournament games | Brier score | 0.2467 | 0.2500 (50/50) |
+| XGBoost + Spline | Predict winner of 2022 tournament games | Accuracy | 55.2% | 50.0% |
+| Random Forest | Predict team's next-season PPG | MAE / R² | 3.59 / 0.074 | 3.90 / -0.151 |
+| LSTM | Predict team's next-season PPG (time series) | Outcome | Collapsed to constant predictions | — |
 
-```
-NCAA-Basketball-Machine-Learning-Prediction/
-├── March_Madness_2023.ipynb    # End-to-end analysis and modeling notebook
-└── README.md
-```
+**Bracket simulation:** The XGBoost model was run on the full 2022 bracket and predicted **Gonzaga** as the champion — matching the consensus pre-tournament favorite (Gonzaga was the #1 overall seed). Kansas, the actual champion, was knocked out in the Sweet 16 of the simulation.
 
-## Dataset
+---
 
-Two data sources are used:
+## Data
 
-- **[March Machine Learning Mania 2023](https://www.kaggle.com/competitions/march-machine-learning-mania-2023/data)** — Kaggle's official competition dataset, including:
-  - `MNCAATourneyDetailedResults.csv` — detailed box scores for every tournament game
-  - `MNCAATourneySeeds.csv` — seeding for each team in each tournament
-  - `MRegularSeasonDetailedResults.csv` — detailed box scores for every regular-season game
-- **FiveThirtyEight NCAA forecasts** (`fivethirtyeight_ncaa_forecasts.csv`) — used for team-ID-to-name mapping and as an external benchmark
+Source: [Kaggle — March Machine Learning Mania 2023](https://www.kaggle.com/competitions/march-machine-learning-mania-2023/data)
 
-The notebook expects these files in `/content/drive/MyDrive/March_Madness_2023/`, since it's set up to run in Google Colab with Google Drive mounted. If you're running locally, update the `pd.read_csv` paths in Step 1 to point to wherever you've placed the CSVs.
+Files used:
+- `MRegularSeasonDetailedResults.csv` — 120k+ regular-season games, 2003-2023, with full box scores
+- `MNCAATourneyDetailedResults.csv` — 1,248 tournament games, 2003-2022
+- `MNCAATourneySeeds.csv` — tournament seeding and regions
+- `MTeams.csv` — team IDs and names
+- `fivethirtyeight_ncaa_forecasts.csv` — 538's 2023 tournament forecasts (reference)
+
+All Kaggle competition files go in a single folder; the notebook expects them at `/content/drive/MyDrive/March_Madness_2023/`.
+
+---
 
 ## Approach
 
-The notebook is organized into four clear steps:
+### 1. Feature engineering
 
-### Step 1 — Setting up the data
-Loads the tournament results, seeds, regular-season results, and FiveThirtyEight forecasts into pandas DataFrames.
+For every (season, team) pair, the notebook computes games-weighted averages from the detailed box scores — points per game, field goal / 3P / FT percentages, rebounds, assists, turnovers, and win percentage — aggregated separately from games the team won and lost, then combined with proper weighting.
 
-### Step 2 — Feature engineering and data representation
-- Builds a `team_id → team_name` lookup from the FiveThirtyEight file
-- Computes field-goal percentage (FG%) for winning and losing teams in every game
-- Aggregates per-team season statistics (average score, average FG%)
-- Filters to the most recent **5 seasons** to keep the dataset focused and recent
-- A **Random Forest Regressor** (`n_estimators=100`) is trained on these aggregate stats to rank team performance and surface top-performing teams
+Each game becomes a training row with **difference features** (`team1_stat - team2_stat`) and a **signed margin** target (`team1_score - team2_score`). Team1 is always the lower TeamID for orientation consistency.
 
-### Step 3 — LSTM model training
-- Normalizes the recent-season stats with `MinMaxScaler`
-- Builds time-series sequences (5-season lookback window) using Keras' `TimeseriesGenerator`
-- Trains a stacked **LSTM** network:
-  - `LSTM(50, return_sequences=True)`
-  - `LSTM(50)`
-  - `Dense(1)` output
-  - Optimizer: `adam`, loss: `mean_squared_error`
+### 2. XGBoost + Spline (primary model)
 
-### Step 4 — 2024 prediction
-Applies the trained LSTM to the 2023 season data to rank teams, takes the `argmax` of the model's outputs, and maps the resulting team ID back to a team name to declare the predicted 2024 champion.
+- **Stage 1**: XGBoost regressor (400 trees, depth 4, lr 0.05) predicts signed win margin from the difference features.
+- **Stage 2**: A smoothing spline (`scipy.interpolate.UnivariateSpline`) maps predicted margin → empirical win probability, fit on training predictions.
 
-Evaluation metrics referenced in the notebook include **Brier score loss** (the official Kaggle competition metric) and **mean absolute error** as a proxy for win-margin prediction.
+The spline is clipped to `[0.20, 0.80]` to reflect the empirical tournament upset rate. Without clipping, the model was overconfident in its highest-probability predictions: the 80-100% predicted bucket only won 57% of the time, which is the classic March Madness upset effect.
 
-## Getting Started
+Evaluated with **Brier score**, the same calibration metric used to grade the Kaggle competition and real-money sports prediction markets.
 
-### Prerequisites
+### 3. Random Forest (secondary model)
 
-- Python 3.8+
-- Jupyter Notebook, JupyterLab, or Google Colab (the notebook is set up for Colab by default)
+A separate task: given a team's prior-season stats, predict their next-season points per game. Uses lag features (`prev_ppg`, `prev_fg_pct`, `prev_win_pct`) with a strictly chronological train/test split to avoid leakage.
 
-### Installation
+The RF modestly outperforms a naive "predict last season unchanged" baseline. The baseline's negative R² is itself informative — it means teams regress toward the mean between seasons, and a model that blindly assumes persistence does worse than predicting the league average. The RF correctly learns to apply some mean-reversion.
 
-Clone the repository:
+### 4. LSTM (failed experiment)
 
-```bash
-git clone https://github.com/hurchey/NCAA-Basketball-Machine-Learning-Prediction.git
-cd NCAA-Basketball-Machine-Learning-Prediction
-```
+Two-layer LSTM on 3-season sequences per team, predicting next-season PPG. The model collapsed to near-constant predictions (~18 pts across all teams) while actual scoring ranged 65-88 pts. Retained in the notebook to document the failure honestly — the Random Forest captures the main signal (mean-reversion) with far less data and complexity.
 
-Install the required packages:
+Known causes: only two input features, short per-team sequence length after windowing, and limited overall training volume. Not worth further iteration on without substantially richer features.
 
-```bash
-pip install numpy pandas scikit-learn scipy matplotlib seaborn xgboost tensorflow jupyter
-```
+---
 
-Or, if you prefer a `requirements.txt`:
+## Limitations and Future Work
 
-```
-numpy
-pandas
-scikit-learn
-scipy
-matplotlib
-seaborn
-xgboost
-tensorflow
-jupyter
-```
+The XGBoost model captures real signal but the edge over a 50/50 baseline on tournament games is modest (1.3% Brier improvement on the 2022 tournament, ~55% accuracy). This is consistent with what basic box-score-only features can achieve; competitive public models (Kaggle winners, KenPom, FiveThirtyEight) typically land in the 0.17-0.19 Brier range with richer feature sets.
 
-### Usage
+The biggest limitation surfaced clearly in the 2022 bracket simulation: the model placed **Murray State** and **South Dakota State** in the Elite Eight — both deep-tournament picks that didn't happen in reality. Without strength-of-schedule adjustments, mid-majors with dominant in-conference records get overvalued relative to power-conference teams that played tougher opponents.
 
-**Option A — Google Colab (recommended, matches the notebook as-written):**
-1. Open the notebook in Colab via the badge at the top of the file.
-2. Download the [March Machine Learning Mania 2023](https://www.kaggle.com/competitions/march-machine-learning-mania-2023/data) dataset plus the FiveThirtyEight forecasts CSV.
-3. Upload the CSVs to `My Drive/March_Madness_2023/` on Google Drive.
-4. Run the cells in order — the notebook will mount Drive and read the files from there.
+The primary next steps would be:
+- **Pace-adjusted efficiency metrics** (points per 100 possessions, KenPom-style)
+- **Strength-of-schedule adjustments** based on opponent quality
+- **Team-rating features** from external sources (Elo, KenPom, or the fivethirtyeight file already in this repo)
+- **Rolling-form features** (last-10-games weighted higher than full-season averages)
 
-**Option B — Local Jupyter:**
-1. Download the datasets as above.
-2. Place them in a local `data/` folder inside the project directory.
-3. Remove (or comment out) the `drive.mount(...)` cell.
-4. Update the `pd.read_csv(...)` paths to point to your local `data/` folder.
-5. Launch Jupyter and run the notebook:
-   ```bash
-   jupyter notebook March_Madness_2023.ipynb
-   ```
+Seed differential alone (from `MNCAATourneySeeds.csv`) is the single highest-leverage feature that isn't currently used — a known strong predictor of tournament outcomes that would likely drop the Brier score meaningfully with ~30 minutes of work.
 
-## Results
+---
 
-Running the full notebook produces a single predicted 2024 champion, printed at the end of Step 4 in the form:
+## How to Run
 
-```
-Predicted top team for 2024: <team name>
-```
+1. Clone the repo
+2. Download the Kaggle competition files listed above and place them in a folder named `March_Madness_2023/` in your Google Drive
+3. Open `March_Madness_2023.ipynb` in Google Colab
+4. `Runtime → Restart and run all`
 
-The ranking is derived from the LSTM's output scores across the 2023 teams, with the top `argmax` treated as the predicted champion. Secondary metrics (Brier score loss and MAE) are set up in Step 1 for evaluation against held-out tournaments.
+The notebook will train all three models, produce the calibration plot, simulate the 2022 bracket round by round, and print a final summary.
 
-> Note: The LSTM training loop currently uses placeholder arrays for `X_train` / `y_train` as a scaffold — a natural next step is to wire the `TimeseriesGenerator` output directly into `model.fit` and report validation metrics on held-out seasons.
+---
 
-## Future Work
+## Tools
 
-- Replace the scaffolded LSTM inputs with the real `TimeseriesGenerator` outputs and report validation Brier score
-- Expand the feature set beyond average score and FG% (rebounds, turnovers, assists, strength of schedule)
-- Incorporate advanced external metrics (KenPom, BPI, NET rankings)
-- Compare the LSTM against simpler baselines (logistic regression, XGBoost) using log-loss
-- Extend the pipeline to predict *every* tournament matchup, not just the champion, and generate a full bracket
-- Apply the same pipeline to the women's tournament (`WNCAATourney*` files from the same Kaggle dataset)
-
-## Acknowledgments
-
-- [Kaggle's March Machine Learning Mania 2023](https://www.kaggle.com/competitions/march-machine-learning-mania-2023) for the tournament and regular-season data
-- [FiveThirtyEight](https://projects.fivethirtyeight.com/) for their NCAA tournament forecasts
-- The broader March Machine Learning Mania community for years of open-sourced approaches and ideas
-
-## Author
-
-**Eric Hurchey** — [@hurchey](https://github.com/hurchey)
-
-## License
-
-Released under the [MIT License](https://opensource.org/licenses/MIT).
+Python · XGBoost · scikit-learn · TensorFlow/Keras · SciPy · pandas · NumPy · matplotlib
